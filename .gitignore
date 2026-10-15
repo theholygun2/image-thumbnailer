@@ -1,0 +1,26 @@
+# deps
+node_modules/
+
+# env files (keep the example committed)
+.env
+.env.*
+!.env.example
+
+# Python (worker)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# build output (includes apps/worker/dist with the ~7 MB Lambda zip)
+dist/
+cdk.out/
+
+# local test files
+thumb.jpg
+poster.jpg
+
+# logs / OS
+*.log
+.DS_Store
+Thumbs.db

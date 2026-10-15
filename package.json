@@ -1,0 +1,12 @@
+{
+  "name": "image-thumbnailer",
+  "private": true,
+  "workspaces": ["apps/*", "infra"],
+  "scripts": {
+    "worker:build": "bash apps/worker/scripts/build.sh",
+    "infra:synth": "bun run --filter @thumbnailer/infra synth",
+    "infra:diff": "bun run --filter @thumbnailer/infra diff",
+    "infra:deploy": "bun run --filter @thumbnailer/infra deploy",
+    "deploy": "bun run worker:build && bun run infra:deploy"
+  }
+}

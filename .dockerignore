@@ -1,0 +1,14 @@
+.git
+**/node_modules
+**/.env
+**/.env.*
+!**/.env.example
+
+# Not needed to run the API
+apps/worker
+infra
+scripts
+docs
+**/dist
+**/cdk.out
+**/*.md

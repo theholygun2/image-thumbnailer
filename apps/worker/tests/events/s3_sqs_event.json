@@ -1,0 +1,20 @@
+{
+  "Records": [
+    {
+      "messageId": "11111111-1111-1111-1111-111111111111",
+      "receiptHandle": "dummy-receipt-handle",
+      "body": "{\"Records\":[{\"eventSource\":\"aws:s3\",\"eventName\":\"ObjectCreated:Post\",\"s3\":{\"bucket\":{\"name\":\"my-bucket\"},\"object\":{\"key\":\"uploads/test-id.jpg\",\"size\":12345}}}]}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1760000000000",
+        "SenderId": "AIDAEXAMPLE",
+        "ApproximateFirstReceiveTimestamp": "1760000000001"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "dummy",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:ap-southeast-1:123456789012:thumbnail-queue",
+      "awsRegion": "ap-southeast-1"
+    }
+  ]
+}
