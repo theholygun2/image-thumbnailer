@@ -1,8 +1,30 @@
-module "example_bucket" {
+module "images_bucket" {
   source = "../../modules/s3_bucket"
-  bucket_name = "kdflasjflasdjlfjasklfjsaljfl"
+
+  bucket_name          = var.bucket_name
+  force_destroy        = true
+  cors_allowed_origins = ["*"]
 }
 
-output "bucket_arn" {
-  value = module.example_bucket.bucket_arn
+module "images_queue" {
+  source = "../../modules/sqs_queue"
+
+  name              = "thumbnailer-${var.environment}"
+  source_bucket_arn = module.images_bucket.bucket_arn
 }
+
+# Only objects under uploads/ trigger the pipeline, so writing thumbnails/
+# never retriggers the worker.
+resource "aws_s3_bucket_notification" "uploads" {
+  bucket = module.images_bucket.bucket_name
+
+  queue {
+    queue_arn = module.images_queue.queue_arn
+    events = ["s3:ObjectCreated:*"]
+    filter_prefix = "uploads/"
+  }
+  # The queue policy must exist before S3 validates the destination, or the
+  # notification fails with "Unable to validate the following destination".
+  depends_on = [module.images_queue]
+}
+
