@@ -1,164 +1,167 @@
-# Serverless Thumbnail Processing Pipeline
+# Image Thumbnailer
 
-An asynchronous image thumbnailing service built with Bun, Hono, Amazon EC2, Amazon S3, Amazon SQS, and AWS Lambda.
-
-The API handles upload authorization and job coordination, while image processing runs asynchronously in Lambda. This separates request handling from potentially time-consuming image processing.
-
-## Features
-
-- Generate thumbnails from uploaded images.
-- Upload files directly to S3 using presigned POST requests.
-- Process image jobs asynchronously through SQS and Lambda.
-- Store original images and generated thumbnails in S3.
-- Retrieve processing results through the API.
-- Handle failed processing through SQS retries and a dead-letter queue.
+Upload an image, get a thumbnail back. A small event-driven pipeline on AWS: a Bun + Hono API hands out presigned S3 uploads, and a Python Lambda generates the thumbnails asynchronously. All infrastructure is defined with OpenTofu.
 
 ## Architecture
 
 ```mermaid
-flowchart TD
-    C[Client]
-    API[Bun + Hono API<br/>Amazon EC2]
-    S3IN[(Amazon S3<br/>Original images)]
-    Q[Amazon SQS<br/>Processing queue]
-    L[AWS Lambda<br/>Thumbnail worker]
-    S3OUT[(Amazon S3<br/>Generated thumbnails)]
+flowchart LR
+    client([Client])
+    subgraph EC2["EC2 (Docker)"]
+        api["Bun + Hono API"]
+    end
+    subgraph AWS
+        s3[("S3 bucket<br/>uploads/ and thumbnails/")]
+        sqs["SQS queue"]
+        dlq["Dead-letter queue"]
+        lambda["Lambda worker<br/>(Python + Pillow)"]
+    end
 
-    C -->|Request upload authorization| API
-    API -->|Presigned POST| C
-    C -->|Upload original image| S3IN
-    C -->|Request processing / confirm upload| API
-    API -->|Enqueue job| Q
-    Q -->|Deliver message| L
-    L -->|Read original image| S3IN
-    L -->|Write thumbnail| S3OUT
-    C -->|Request result / status| API
-    API -->|Check stored objects| S3IN
-    API -->|Check stored objects| S3OUT
-    API -->|Return status / result URL| C
+    client -- "1. POST /api/uploads" --> api
+    api -- "2. presigned POST" --> client
+    client -- "3. upload image" --> s3
+    s3 -- "4. ObjectCreated event<br/>(uploads/ prefix)" --> sqs
+    sqs -- "5. trigger" --> lambda
+    lambda -- "6. read upload,<br/>write thumbnails/id.jpg" --> s3
+    sqs -. "after 3 failed receives" .-> dlq
+    client -- "7. GET /api/images/id" --> api
+    api -- "8. HeadObject +<br/>presigned GET URL" --> s3
 ```
 
-> Adjust the diagram to match the actual trigger and status-checking mechanisms in your implementation.
+1. The client asks the API for an upload slot.
+2. The API returns a presigned POST for `uploads/<uuid>.<ext>`. The image never passes through the API.
+3. The client uploads directly to S3.
+4. S3 sends an `ObjectCreated` event to SQS, only for keys under `uploads/`.
+5. SQS triggers the Lambda worker.
+6. The worker writes a 256px JPEG thumbnail to `thumbnails/<uuid>.jpg`.
+7. The client polls the API for status.
+8. Once the thumbnail exists, the API returns a short-lived presigned download URL.
 
-## Request lifecycle
+## Stack
 
-1. **Upload authorization:** The client requests permission to upload an image. The API generates a presigned POST with the configured upload restrictions.
-2. **Direct upload:** The client uploads the original image directly to S3, avoiding the need to stream the entire file through the API server.
-3. **Job submission:** The API enqueues a processing job in SQS after the upload workflow is confirmed.
-4. **Asynchronous processing:** Lambda consumes the queued job, retrieves the original image, generates a thumbnail, and writes the output to S3.
-5. **Result retrieval:** The client requests the processing status or thumbnail through the API. The API determines the available result using the implemented S3 object checks.
-
-## Technology stack
-
-| Technology | Responsibility |
+| Part | Tech |
 |---|---|
-| Bun | JavaScript/TypeScript runtime |
-| Hono | HTTP API |
-| Amazon EC2 | API hosting |
-| Amazon S3 | Original image and thumbnail storage |
-| Amazon SQS | Asynchronous job delivery |
-| AWS Lambda | Image processing |
-| [Image library] | Thumbnail generation |
+| API | Bun, Hono, Zod, OpenAPI (Scalar docs at `/reference`), Pino |
+| Worker | Python 3.12, Pillow, AWS Lambda (x86_64) |
+| AWS | S3, SQS (+ DLQ), Lambda, EC2, IAM, CloudWatch |
+| Infra | OpenTofu (modules: `s3_bucket`, `sqs_queue`, `lambda_function`, `ec2_instance`) |
+| Runtime | Docker + Docker Compose on EC2 |
 
-## Getting started
+## API
 
-### Prerequisites
+| Endpoint | Description |
+|---|---|
+| `POST /api/uploads` | Body `{ "contentType": "image/jpeg" }` (JPEG, PNG, or WebP). Returns `{ id, url, fields, expiresIn }`, a presigned POST. |
+| `GET /api/images/:id` | Returns `{ "status": "pending" }` or `{ "status": "ready", "thumbnailUrl", "expiresIn" }`. |
+| `GET /health` | Liveness check. |
+| `GET /reference` | Interactive API docs (OpenAPI spec at `/openapi.json`). |
 
-- Bun
-- AWS account and AWS CLI
-- Appropriate AWS IAM permissions
-- Access to the required S3 buckets, SQS queue and Lambda function
+## Design decisions
 
-### Local development
+- **Presigned POST instead of PUT.** S3 itself enforces the 10 MB limit and the declared content type, and pins the object key. Clients can't upload outside their assigned key or bypass the limits by skipping the API.
+- **Status comes from S3, not a database.** The API checks whether `thumbnails/<id>.jpg` exists. Fewer moving parts for a project this size.
+- **Partial batch failures.** The worker reports failed messages individually (`ReportBatchItemFailures`), so one bad image doesn't retry the whole batch.
+- **Retries and a DLQ.** After 3 failed receives, a message moves to the dead-letter queue (14-day retention). The queue's 180s visibility timeout is 6x the Lambda's 30s timeout.
+- **No processing loop.** The S3 notification is filtered to `uploads/`, so writing thumbnails never retriggers the worker.
+- **The worker checks the real image format**, not the file extension, and strips metadata (EXIF/GPS). Transparency is flattened onto white for JPEG output.
+- **No static AWS credentials anywhere.** The API uses the EC2 instance role. IMDSv2 is required (hop limit 2 so containers can reach it), and shell access is through SSM Session Manager, with no SSH and only port 80 open.
+- **Private bucket** with public access blocked, default encryption, and TLS-only policies on the bucket and queue.
+- **Least-privilege IAM, defined once per consumer.** The worker reads `uploads/*` and writes `thumbnails/*`. The API does the reverse (put uploads, get thumbnails, list the bucket).
 
-Clone the repository:
+## Known limits
+
+- **No auth.** The API is public by design for this demo. Rate limiting on `POST /api/uploads` would be the next step.
+- **Failed jobs stay `pending`.** Without a database there's no failure status, and an unknown ID also looks `pending`. Failures are visible in CloudWatch and the DLQ.
+- **HTTP only.** The API has no TLS (S3 URLs are HTTPS regardless). A reverse proxy or load balancer would add it.
+- **Single instance**, no autoscaling, and the public IP changes if the instance is stopped and started.
+
+## Repository layout
+
+```
+apps/
+  api/          Bun + Hono API (Dockerfile, src/, .env.example)
+  worker/       Python Lambda (src/, tests/, requirements*.txt)
+infra/
+  modules/      s3_bucket, sqs_queue, lambda_function, ec2_instance
+  envs/
+    dev/        root module for the dev environment
+    prod/       same layout with different values (not deployed)
+scripts/        smoke-test.sh, break-it.sh
+docker-compose.yml
+```
+
+## Running locally
+
+**API** (needs AWS credentials, e.g. from the AWS CLI, and an existing bucket):
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
 bun install
+cp apps/api/.env.example apps/api/.env   # set AWS_REGION and S3_BUCKET
+cd apps/api && bun run --hot src/index.ts
 ```
 
-Configure the required environment variables using the provided `.env.example`.
+**Worker tests:**
 
 ```bash
-cp .env.example .env
+cd apps/worker
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pytest
 ```
 
-Start the API using the project's development script:
+## Deploying
+
+1. **Build the Lambda zip** (Linux wheels, so Pillow works on Lambda):
 
 ```bash
-bun run dev
+   cd apps/worker
+   rm -rf dist
+   pip install -r requirements.txt --platform manylinux2014_x86_64 \
+     --only-binary=:all: --implementation cp --python-version 3.12 --target dist/package
+   cp src/*.py dist/package/
+   python - <<'EOF'
+   import pathlib, zipfile
+   root = pathlib.Path("dist/package")
+   with zipfile.ZipFile("dist/worker.zip", "w", zipfile.ZIP_DEFLATED) as z:
+       for p in root.rglob("*"):
+           if p.is_file() and "__pycache__" not in p.parts:
+               z.write(p, p.relative_to(root).as_posix())
+   EOF
 ```
 
-Run tests:
+2. **Apply the infrastructure.** Set `environment` and `bucket_name` in `infra/envs/dev/terraform.tfvars`, then:
 
 ```bash
-bun test
+   cd infra/envs/dev
+   tofu init
+   tofu plan
+   tofu apply
 ```
 
-See the configuration reference below for the required variables and AWS resources.
+3. **Start the API on the instance.** Open a shell via EC2 > Connect > Session Manager, then:
 
-### Deployment
+```bash
+   git clone <this-repo-url> && cd image-thumbnailer
+   # create apps/api/.env with PORT=3000, APP_URL, AWS_REGION, S3_BUCKET
+   sudo HOST_PORT=80 docker compose up -d --build
+```
 
-The production API runs on Amazon EC2, and image processing runs in AWS Lambda.
-
-1. Configure the S3 buckets, SQS queue, DLQ, and Lambda function.
-2. Configure the API environment and IAM permissions.
-3. Deploy the Bun/Hono API to EC2.
-4. Configure the Lambda function and SQS event source mapping.
-5. Verify the upload, processing, failure, and result-retrieval flows.
-
-See [deployment documentation](<deployment-documentation-path>) for the exact commands and configuration.
-
-## Design decisions and limitations
-
-### Presigned POST uploads
-
-The API issues presigned POST policies so clients can upload directly to S3. The policy can enforce supported content types and a maximum file size.
-
-These restrictions reduce unnecessary traffic through the API and reject some invalid uploads before storage. Content-type metadata alone does not prove that a file contains a valid image, so the processing worker must still validate its input.
-
-### S3-derived status
-
-Processing status is derived from the presence of expected S3 objects rather than maintained in a separate job-status database.
-
-This avoids a separate status store, but it limits the status model. Object presence can establish that an output exists; it does not necessarily explain whether a job is queued, actively processing, or permanently failed. Intermediate states and failure reasons require additional tracking if needed.
-
-### Retries and dead-letter queue
-
-SQS and Lambda support retrying failed processing attempts. Messages that exceed the configured receive threshold are routed to the DLQ according to the queue's redrive policy.
-
-The DLQ provides a place to inspect failed jobs and investigate errors. It does not automatically resolve them. Recovery requires an operational procedure for diagnosing and redriving eligible messages.
-
-### Authentication
-
-Authentication is intentionally omitted from this version to keep the project focused on the asynchronous processing pipeline.
-
-As a result, the service should not be treated as a production-ready public service without appropriate access controls, upload restrictions, abuse prevention, and cost safeguards.
+   `S3_BUCKET` comes from `tofu output -raw bucket_name`, and the instance IP from `tofu output -raw api_public_ip`.
 
 ## Testing
 
-The project includes [describe the tests that actually exist].
+```bash
+API_URL=http://<ip>/api bash scripts/smoke-test.sh photo.jpg   # upload, then wait for the thumbnail
+API_URL=http://<ip>/api bash scripts/break-it.sh photo.jpg     # presigned POST limits and validation
+```
 
-Important scenarios to validate include:
+`break-it.sh` checks that a tampered key, a wrong or missing content type, and an oversized file are all rejected by S3. A text file renamed to `.jpg` should end up in the DLQ after retries.
 
-- Successful thumbnail generation.
-- Unsupported and corrupted image uploads.
-- Duplicate message delivery.
-- Lambda processing failures and retries.
-- DLQ routing after repeated failures.
-- Missing original images or generated thumbnails.
-- Presigned POST expiration and size/type restrictions.
+## Teardown
 
-## Future improvements
+```bash
+cd infra/envs/dev
+tofu destroy
+```
 
-- Add persistent job state and failure reasons.
-- Add CloudWatch dashboards and alarms.
-- Automate infrastructure provisioning and deployment.
-- Add authentication, rate limiting, and per-user quotas.
-- Add load tests and document throughput, latency, and cost.
-
-## License
-
-[Specify your license, if applicable.]
+The dev bucket uses `force_destroy`, so it is removed even when it contains objects. The instance runs 24/7 while it exists, so stop it when you're not demoing.

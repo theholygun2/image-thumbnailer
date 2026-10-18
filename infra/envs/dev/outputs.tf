@@ -9,3 +9,11 @@ output "queue_url" {
 output "dlq_url" {
   value = module.images_queue.dlq_url
 }
+
+output "worker_function_name" {
+  value = module.worker.function_name
+}
+
+output "worker_log_group" {
+  value = module.worker.log_group_name
+}
