@@ -7,10 +7,10 @@ Upload an image, get a thumbnail back. A small event-driven pipeline on AWS: a B
 ```mermaid
 flowchart LR
     client([Client])
-    subgraph EC2["EC2 (Docker)"]
-        api["Bun + Hono API"]
+    subgraph VPC["Existing VPC, public subnet"]
+        api["Bun + Hono API<br/>(Docker on EC2)"]
     end
-    subgraph AWS
+    subgraph AWS["AWS regional services"]
         s3[("S3 bucket<br/>uploads/ and thumbnails/")]
         sqs["SQS queue"]
         dlq["Dead-letter queue"]
@@ -36,6 +36,12 @@ flowchart LR
 6. The worker writes a 256px JPEG thumbnail to `thumbnails/<uuid>.jpg`.
 7. The client polls the API for status.
 8. Once the thumbnail exists, the API returns a short-lived presigned download URL.
+
+## Demo
+
+![API reference](docs/images/api-reference.png)
+
+![Original vs thumbnail](docs/images/before-after.png)
 
 ## Stack
 
@@ -66,7 +72,9 @@ flowchart LR
 - **The worker checks the real image format**, not the file extension, and strips metadata (EXIF/GPS). Transparency is flattened onto white for JPEG output.
 - **No static AWS credentials anywhere.** The API uses the EC2 instance role. IMDSv2 is required (hop limit 2 so containers can reach it), and shell access is through SSM Session Manager, with no SSH and only port 80 open.
 - **Private bucket** with public access blocked, default encryption, and TLS-only policies on the bucket and queue.
-- **Least-privilege IAM, defined once per consumer.** The worker reads `uploads/*` and writes `thumbnails/*`. The API does the reverse (put uploads, get thumbnails, list the bucket).
+- **Least-privilege IAM, defined once per consumer.** The worker reads `uploads/*` and writes `thumbnails/*`. The API does the reverse (put uploads, get thumbnails, list the bucket). The environment builds these policy documents and passes them into generic modules, so the modules don't hardcode any prefixes.
+- **Lambda stays outside the VPC.** It only talks to S3 and SQS, which are regional services. Putting it in a VPC would need a NAT gateway or VPC endpoints for no benefit.
+- **The VPC is an input, not managed here.** The EC2 module takes an existing `vpc_id` and `subnet_id`, so `tofu destroy` never touches shared networking.
 
 ## Known limits
 
@@ -74,6 +82,7 @@ flowchart LR
 - **Failed jobs stay `pending`.** Without a database there's no failure status, and an unknown ID also looks `pending`. Failures are visible in CloudWatch and the DLQ.
 - **HTTP only.** The API has no TLS (S3 URLs are HTTPS regardless). A reverse proxy or load balancer would add it.
 - **Single instance**, no autoscaling, and the public IP changes if the instance is stopped and started.
+- **Local OpenTofu state.** The state file isn't committed and there's no remote backend.
 
 ## Repository layout
 
@@ -84,15 +93,23 @@ apps/
 infra/
   modules/      s3_bucket, sqs_queue, lambda_function, ec2_instance
   envs/
-    dev/        root module for the dev environment
+    dev/        root module for dev (main.tf, providers.tf, variables.tf, outputs.tf, user_data.sh)
     prod/       same layout with different values (not deployed)
+docs/images/    README screenshots
 scripts/        smoke-test.sh, break-it.sh
 docker-compose.yml
 ```
 
+## Prerequisites
+
+- AWS credentials configured locally (for example `aws configure` or SSO), and OpenTofu 1.8 or later.
+- Bun, and Python 3 with pip (to build the Lambda zip).
+- `curl` and `jq` for the test scripts.
+- **An existing VPC** with a public subnet: a route for `0.0.0.0/0` to an internet gateway. Its `vpc_id` and `subnet_id` go into `terraform.tfvars`.
+
 ## Running locally
 
-**API** (needs AWS credentials, e.g. from the AWS CLI, and an existing bucket):
+**API** (needs AWS credentials, for example from the AWS CLI, and an existing bucket):
 
 ```bash
 bun install
@@ -129,7 +146,16 @@ pytest
    EOF
 ```
 
-2. **Apply the infrastructure.** Set `environment` and `bucket_name` in `infra/envs/dev/terraform.tfvars`, then:
+2. **Apply the infrastructure.** Create `infra/envs/dev/terraform.tfvars`:
+
+```hcl
+   environment = "dev"
+   bucket_name = "thumbnailer-dev-<account-id>"
+   vpc_id      = "vpc-xxxxxxxx"
+   subnet_id   = "subnet-xxxxxxxx"
+```
+
+   Then:
 
 ```bash
    cd infra/envs/dev
@@ -138,10 +164,13 @@ pytest
    tofu apply
 ```
 
-3. **Start the API on the instance.** Open a shell via EC2 > Connect > Session Manager, then:
+   This creates the bucket, queues, Lambda, and EC2 instance with its role and security group. A first-boot script (`user_data.sh`) installs Docker, Compose, and buildx.
+
+3. **Start the API on the instance.** Wait two or three minutes after apply, then open a shell via EC2 > Connect > Session Manager:
 
 ```bash
-   git clone <this-repo-url> && cd image-thumbnailer
+   cd ~
+   git clone https://github.com/theholygun2/image-thumbnailer.git && cd image-thumbnailer
    # create apps/api/.env with PORT=3000, APP_URL, AWS_REGION, S3_BUCKET
    sudo HOST_PORT=80 docker compose up -d --build
 ```
@@ -155,7 +184,20 @@ API_URL=http://<ip>/api bash scripts/smoke-test.sh photo.jpg   # upload, then wa
 API_URL=http://<ip>/api bash scripts/break-it.sh photo.jpg     # presigned POST limits and validation
 ```
 
-`break-it.sh` checks that a tampered key, a wrong or missing content type, and an oversized file are all rejected by S3. A text file renamed to `.jpg` should end up in the DLQ after retries.
+`break-it.sh` checks that a tampered key, a wrong or missing content type, and an oversized file are all rejected by S3 itself. Result against the deployed stack:
+
+```
+PASS  control: valid upload accepted (HTTP 204 )
+PASS  tampered key rejected (HTTP 403 AccessDenied)
+PASS  wrong Content-Type rejected (HTTP 403 AccessDenied)
+PASS  missing Content-Type rejected (HTTP 403 AccessDenied)
+PASS  11 MB file rejected (HTTP 400 EntityTooLarge)
+PASS  unsupported contentType gives 400 (HTTP 400 )
+PASS  malformed image id gives 400 (HTTP 400 )
+PASS  unknown valid id gives 200 (pending) (HTTP 200 )
+```
+
+A text file renamed to `.jpg` is accepted by S3 (it doesn't inspect contents) but fails in the worker, so it ends up in the dead-letter queue after the retries.
 
 ## Teardown
 
@@ -164,4 +206,4 @@ cd infra/envs/dev
 tofu destroy
 ```
 
-The dev bucket uses `force_destroy`, so it is removed even when it contains objects. The instance runs 24/7 while it exists, so stop it when you're not demoing.
+The dev bucket uses `force_destroy`, so it is removed even when it contains objects. The VPC is not managed here and stays untouched. The instance runs 24/7 while it exists, so stop it when you're not demoing.
