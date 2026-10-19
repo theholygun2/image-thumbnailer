@@ -1,2 +1,4 @@
 environment = "dev-or-prod"
 bucket_name = "your-bucket-name"
+vpc_id      = "vpc-"
+subnet_id   = "subnet-"

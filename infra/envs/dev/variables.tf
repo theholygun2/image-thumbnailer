@@ -13,3 +13,13 @@ variable "bucket_name" {
   description = "Globally unique name for the images bucket (max 63 characters)."
   type        = string
 }
+
+variable "vpc_id" {
+  description = "VPC that the instance and its security group live in."
+  type        = string
+}
+
+variable "subnet_id" {
+  description = "A public subnet (route to an internet gateway) in that VPC."
+  type        = string
+}

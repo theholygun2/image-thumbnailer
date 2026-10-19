@@ -51,3 +51,35 @@ module "worker" {
   queue_arn   = module.images_queue.queue_arn
   policy_json = data.aws_iam_policy_document.worker_s3.json
 }
+
+# What the API may touch: create uploads (presigned POST), read thumbnails,
+# and list the bucket so a missing key returns 404 instead of 403.
+data "aws_iam_policy_document" "api_s3" {
+  statement {
+    sid       = "PutUploads"
+    actions   = ["s3:PutObject"]
+    resources = ["${module.images_bucket.bucket_arn}/uploads/*"]
+  }
+
+  statement {
+    sid       = "GetThumbnails"
+    actions   = ["s3:GetObject"]
+    resources = ["${module.images_bucket.bucket_arn}/thumbnails/*"]
+  }
+
+  statement {
+    sid       = "ListBucket"
+    actions   = ["s3:ListBucket"]
+    resources = [module.images_bucket.bucket_arn]
+  }
+}
+
+module "api_host" {
+  source = "../../modules/ec2_instance"
+
+  name        = "thumbnailer-${var.environment}-api"
+  policy_json = data.aws_iam_policy_document.api_s3.json
+  user_data   = file("${path.module}/user_data.sh")
+  vpc_id      = var.vpc_id
+  subnet_id   = var.subnet_id
+}
