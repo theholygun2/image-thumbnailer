@@ -1,5 +1,7 @@
 # Image Thumbnailer
 
+![CI](https://github.com/theholygun2/image-thumbnailer/actions/workflows/ci.yml/badge.svg)
+
 Upload an image, get a thumbnail back. A small event-driven pipeline on AWS: a Bun + Hono API hands out presigned S3 uploads, and a Python Lambda generates the thumbnails asynchronously. All infrastructure is defined with OpenTofu.
 
 ## Architecture
@@ -67,7 +69,7 @@ flowchart LR
 - **Presigned POST instead of PUT.** S3 itself enforces the 10 MB limit and the declared content type, and pins the object key. Clients can't upload outside their assigned key or bypass the limits by skipping the API.
 - **Status comes from S3, not a database.** The API checks whether `thumbnails/<id>.jpg` exists. Fewer moving parts for a project this size.
 - **Partial batch failures.** The worker reports failed messages individually (`ReportBatchItemFailures`), so one bad image doesn't retry the whole batch.
-- **Retries and a DLQ.** After 3 failed receives, a message moves to the dead-letter queue (14-day retention). The queue's 180s visibility timeout is 6x the Lambda's 30s timeout.
+- **Retries and a DLQ.** After 3 failed receives, a message moves to the dead-letter queue (14-day retention). The queue's 180s visibility timeout is 6x the Lambda's 30s timeout. A CloudWatch alarm emails me when messages land in the DLQ, making failed processing visible and easier to investigate.
 - **No processing loop.** The S3 notification is filtered to `uploads/`, so writing thumbnails never retriggers the worker.
 - **The worker checks the real image format**, not the file extension, and strips metadata (EXIF/GPS). Transparency is flattened onto white for JPEG output.
 - **No static AWS credentials anywhere.** The API uses the EC2 instance role. IMDSv2 is required (hop limit 2 so containers can reach it), and shell access is through SSM Session Manager, with no SSH and only port 80 open.
@@ -78,15 +80,15 @@ flowchart LR
 
 ## Known limits
 
-- **No auth.** The API is public by design for this demo. Rate limiting on `POST /api/uploads` would be the next step.
-- **Failed jobs stay `pending`.** Without a database there's no failure status, and an unknown ID also looks `pending`. Failures are visible in CloudWatch and the DLQ.
-- **HTTP only.** The API has no TLS (S3 URLs are HTTPS regardless). A reverse proxy or load balancer would add it.
-- **Single instance**, no autoscaling, and the public IP changes if the instance is stopped and started.
-- **Local OpenTofu state.** The state file isn't committed and there's no remote backend.
+- **No auth.** The API is public by design for this demo. Rate limiting on `POST /api/uploads` would be a sensible next step before opening it to broader use.
+- **Failed jobs stay `pending`.** Without a database there's no failure status, and an unknown ID also looks `pending`. Failures are visible in CloudWatch and the DLQ, and a CloudWatch alarm emails me when messages land in the DLQ.
+- **HTTP only.** The API has no TLS (S3 URLs are HTTPS regardless). A reverse proxy or load balancer would add it and be a sensible improvement for a more production-ready deployment.
+- **Single instance**, no autoscaling, and the public IP changes if the instance is stopped and started. This keeps the demo simple, but it is not designed for high availability.
+- **Local OpenTofu state.** The state file isn't committed and there's no remote backend. A remote backend with state locking would be a useful next step for collaboration or production use.
 
 ## Repository layout
 
-```
+```text
 apps/
   api/          Bun + Hono API (Dockerfile, src/, .env.example)
   worker/       Python Lambda (src/, tests/, requirements*.txt)
@@ -113,7 +115,7 @@ docker-compose.yml
 
 ```bash
 bun install
-cp apps/api/.env.example apps/api/.env   # set AWS_REGION and S3_BUCKET
+cp apps/api/.env.example apps/api/.env  # set AWS_REGION and S3_BUCKET
 cd apps/api && bun run --hot src/index.ts
 ```
 
@@ -121,7 +123,7 @@ cd apps/api && bun run --hot src/index.ts
 
 ```bash
 cd apps/worker
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 pytest
 ```
@@ -130,7 +132,7 @@ pytest
 
 1. **Build the Lambda zip** (Linux wheels, so Pillow works on Lambda):
 
-```bash
+   ```bash
    cd apps/worker
    rm -rf dist
    pip install -r requirements.txt --platform manylinux2014_x86_64 \
@@ -144,49 +146,49 @@ pytest
            if p.is_file() and "__pycache__" not in p.parts:
                z.write(p, p.relative_to(root).as_posix())
    EOF
-```
+   ```
 
 2. **Apply the infrastructure.** Create `infra/envs/dev/terraform.tfvars`:
 
-```hcl
+   ```hcl
    environment = "dev"
    bucket_name = "thumbnailer-dev-<account-id>"
    vpc_id      = "vpc-xxxxxxxx"
    subnet_id   = "subnet-xxxxxxxx"
-```
+   ```
 
    Then:
 
-```bash
+   ```bash
    cd infra/envs/dev
    tofu init
    tofu plan
    tofu apply
-```
+   ```
 
    This creates the bucket, queues, Lambda, and EC2 instance with its role and security group. A first-boot script (`user_data.sh`) installs Docker, Compose, and buildx.
 
 3. **Start the API on the instance.** Wait two or three minutes after apply, then open a shell via EC2 > Connect > Session Manager:
 
-```bash
+   ```bash
    cd ~
    git clone https://github.com/theholygun2/image-thumbnailer.git && cd image-thumbnailer
    # create apps/api/.env with PORT=3000, APP_URL, AWS_REGION, S3_BUCKET
    sudo HOST_PORT=80 docker compose up -d --build
-```
+   ```
 
    `S3_BUCKET` comes from `tofu output -raw bucket_name`, and the instance IP from `tofu output -raw api_public_ip`.
 
 ## Testing
 
 ```bash
-API_URL=http://<ip>/api bash scripts/smoke-test.sh photo.jpg   # upload, then wait for the thumbnail
-API_URL=http://<ip>/api bash scripts/break-it.sh photo.jpg     # presigned POST limits and validation
+API_URL=http://<ip>/api bash scripts/smoke-test.sh photo.jpg  # upload, then wait for the thumbnail
+API_URL=http://<ip>/api bash scripts/break-it.sh photo.jpg    # presigned POST limits and validation
 ```
 
 `break-it.sh` checks that a tampered key, a wrong or missing content type, and an oversized file are all rejected by S3 itself. Result against the deployed stack:
 
-```
+```text
 PASS  control: valid upload accepted (HTTP 204 )
 PASS  tampered key rejected (HTTP 403 AccessDenied)
 PASS  wrong Content-Type rejected (HTTP 403 AccessDenied)
