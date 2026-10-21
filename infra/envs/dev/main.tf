@@ -83,3 +83,11 @@ module "api_host" {
   vpc_id      = var.vpc_id
   subnet_id   = var.subnet_id
 }
+
+module "dlq_alarm" {
+  source = "../../modules/dlq_alarm"
+
+  name       = "thumbnailer-${var.environment}-dlq-alarm"
+  queue_name = module.images_queue.dlq_name
+  email      = var.alert_email
+}

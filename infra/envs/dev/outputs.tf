@@ -25,3 +25,11 @@ output "api_instance_id" {
 output "api_public_ip" {
   value = module.api_host.public_ip
 }
+
+output "dlq_alarm_name" {
+  value = module.dlq_alarm.alarm_name
+}
+
+output "alerts_topic_arn" {
+  value = module.dlq_alarm.topic_arn
+}

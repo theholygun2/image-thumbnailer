@@ -23,3 +23,8 @@ variable "subnet_id" {
   description = "A public subnet (route to an internet gateway) in that VPC."
   type        = string
 }
+
+variable "alert_email" {
+  description = "Email address for DLQ alarm notifications."
+  type        = string
+}
